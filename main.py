@@ -1,317 +1,286 @@
-import os
-import sys
+from __future__ import annotations
+
+import shlex
 import time
-import base64
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.patch_stdout import patch_stdout
 
 
 # ============================================================
-# THE FORGOTTEN SERVER
-# A fictional, self-contained Linux CTF
+# Game State
 # ============================================================
-
-VERSION = "1.0.0"
-
-INTRO = r"""
-╔════════════════════════════════════════════════════════════╗
-║                  THE FORGOTTEN SERVER                     ║
-║                    Linux CTF - Easy                       ║
-╚════════════════════════════════════════════════════════════╝
-
-あなたはセキュリティ監査チームのメンバーだ。
-
-ある企業から、長期間放置されている
-社内研究用サーバーのセキュリティ調査を依頼された。
-
-このサーバーは外部ネットワークから隔離されている。
-
-しかし、管理者は数年前に退職しており、
-現在の構成を把握している人物は誰もいない。
-
-あなたに与えられた情報はこれだけだ。
-
-    Target: lab-server
-
-目的:
-
-    [1] user.txt を取得する
-    [2] root.txt を取得する
-
-これは許可された検証環境である。
-
-Good luck.
-
-"""
-
-
-# ============================================================
-# GAME STATE
-# ============================================================
-
-START_TIME = time.time()
 
 STATE = {
-    "user_flag": False,
-    "root_flag": False,
-
-    "found_backup": False,
-    "found_credentials": False,
-    "found_history": False,
-    "found_script": False,
     "checked_sudo": False,
-
-    "root": False,
-
+    "found_backup": False,
+    "found_script": False,
     "created_fake_tar": False,
     "executed_exploit": False,
+    "root": False,
+    "path": "/usr/local/bin:/usr/bin:/bin",
+    "start_time": time.time(),
 }
 
 
 # ============================================================
-# VIRTUAL FILESYSTEM
+# Virtual Filesystem
 # ============================================================
 
+@dataclass
 class Node:
-
-    def __init__(
-        self,
-        name,
-        node_type="dir",
-        content="",
-        owner="root",
-        perm="755"
-    ):
-        self.name = name
-        self.type = node_type
-        self.content = content
-        self.owner = owner
-        self.perm = perm
-
-        self.children = {}
-        self.parent = None
-
-    def add(self, node):
-        node.parent = self
-        self.children[node.name] = node
+    name: str
+    node_type: str = "file"
+    content: str = ""
+    owner: str = "user"
+    perm: int = 0o644
+    children: Dict[str, "Node"] = field(default_factory=dict)
 
 
 class VirtualFS:
-
     def __init__(self):
-
-        self.root = self.build_filesystem()
-        self.current = self.root
         self.user = "user"
+        self.cwd = "/home/user"
+
+        self.root = Node(
+            name="/",
+            node_type="dir",
+            owner="root",
+            perm=0o755,
+        )
+
+        self._build_filesystem()
 
     # --------------------------------------------------------
-    # BUILD FILESYSTEM
+    # Filesystem construction
     # --------------------------------------------------------
 
-    def build_filesystem(self):
+    def _mkdir(
+        self,
+        path: str,
+        owner: str = "root",
+        perm: int = 0o755,
+    ) -> Node:
+        parts = self._split(path)
+        current = self.root
 
-        root = Node("/")
+        for part in parts:
+            if part not in current.children:
+                current.children[part] = Node(
+                    name=part,
+                    node_type="dir",
+                    owner=owner,
+                    perm=perm,
+                )
 
-        # ====================================================
-        # /home
-        # ====================================================
+            current = current.children[part]
 
-        home = Node("home")
+        return current
 
-        user = Node(
-            "user",
+    def _mkfile(
+        self,
+        path: str,
+        content: str = "",
+        owner: str = "root",
+        perm: int = 0o644,
+    ) -> Node:
+        parts = self._split(path)
+
+        if not parts:
+            raise ValueError("Invalid file path")
+
+        parent_parts = parts[:-1]
+        filename = parts[-1]
+
+        current = self.root
+
+        for part in parent_parts:
+            if part not in current.children:
+                current.children[part] = Node(
+                    name=part,
+                    node_type="dir",
+                    owner=owner,
+                    perm=0o755,
+                )
+
+            current = current.children[part]
+
+        current.children[filename] = Node(
+            name=filename,
+            node_type="file",
+            content=content,
+            owner=owner,
+            perm=perm,
+        )
+
+        return current.children[filename]
+
+    def _build_filesystem(self):
+        # ----------------------------------------------------
+        # Directories
+        # ----------------------------------------------------
+
+        directories = [
+            "/home",
+            "/home/user",
+            "/var",
+            "/var/www",
+            "/var/www/html",
+            "/var/www/html/backup",
+            "/var/backups",
+            "/var/log",
+            "/opt",
+            "/opt/maintenance",
+            "/etc",
+            "/tmp",
+            "/usr",
+            "/usr/bin",
+            "/usr/local",
+            "/usr/local/bin",
+            "/bin",
+            "/root",
+        ]
+
+        for directory in directories:
+            owner = "root"
+
+            if directory.startswith("/home/user"):
+                owner = "user"
+
+            self._mkdir(directory, owner=owner)
+
+        # ----------------------------------------------------
+        # User files
+        # ----------------------------------------------------
+
+        self._mkfile(
+            "/home/user/README.txt",
+            """Welcome to the internal research server.
+
+Your account has limited privileges.
+
+Useful commands:
+  ls
+  cd
+  cat
+  find
+  grep
+  sudo
+  python
+  which
+  export
+
+The objective is to investigate the system and recover
+the user and root flags.
+""",
             owner="user",
-            perm="755"
         )
 
-        # ----------------------------------------------------
-        # README
-        # ----------------------------------------------------
+        self._mkfile(
+            "/home/user/notes.txt",
+            """Maintenance notes:
 
-        user.add(
-            Node(
-                "README.txt",
-                "file",
-                """Welcome to the research server.
+- The web application was backed up regularly.
+- Old backups were moved into the web directory.
+- The maintenance team used a Python script under /opt.
+- Some old configuration files may still contain useful information.
 
-This machine has been abandoned.
-
-The original administrator left behind
-several maintenance scripts.
-
-Some of the web application files were
-also never removed.
-
-If you are performing a security audit,
-start with enumeration.
-
--- operations
+Do not delete anything until the investigation is complete.
 """,
-                owner="user"
-            )
+            owner="user",
         )
 
-        # ----------------------------------------------------
-        # NOTES
-        # ----------------------------------------------------
-
-        user.add(
-            Node(
-                "notes.txt",
-                "file",
-                """Maintenance notes
-
-The web application was migrated years ago.
-
-Old backups:
-    /var/www/html/backup/
-
-Maintenance scripts:
-    /opt/maintenance/
-
-The backup system is still running.
-
-I should really remove the old credentials
-from the backup files.
-
--- admin
-""",
-                owner="user"
-            )
-        )
-
-        # ----------------------------------------------------
-        # BASH HISTORY
-        # ----------------------------------------------------
-
-        user.add(
-            Node(
-                ".bash_history",
-                "file",
-                """ls
+        self._mkfile(
+            "/home/user/.bash_history",
+            """ls
+cat notes.txt
 cd /var/www/html
 ls
 cd backup
+ls
 cat config.bak
 cd /opt/maintenance
 ls
 cat backup.py
 sudo -l
+which tar
 """,
-                owner="user"
-            )
+            owner="user",
+            perm=0o600,
+        )
+
+        self._mkfile(
+            "/home/user/user.txt",
+            "FORGOTTEN{first_access_7c91}\n",
+            owner="user",
+            perm=0o644,
         )
 
         # ----------------------------------------------------
-        # user flag
+        # Web application
         # ----------------------------------------------------
 
-        user.add(
-            Node(
-                "user.txt",
-                "file",
-                "FORGOTTEN{first_access_7c91}\n",
-                owner="user",
-                perm="600"
-            )
-        )
-
-        home.add(user)
-
-        # ====================================================
-        # /var/www/html
-        # ====================================================
-
-        var = Node("var")
-        www = Node("www")
-        html = Node("html")
-
-        html.add(
-            Node(
-                "index.html",
-                "file",
-                """<html>
+        self._mkfile(
+            "/var/www/html/index.html",
+            """<!DOCTYPE html>
+<html>
 <head>
-<title>Research Portal</title>
+    <title>Research Portal</title>
 </head>
-
 <body>
-
-<h1>Internal Research Portal</h1>
-
-<p>Server migration completed.</p>
-
-<!-- TODO: remove backup directory -->
-
+    <h1>Internal Research Portal</h1>
+    <p>Legacy application.</p>
 </body>
 </html>
-"""
-            )
+""",
+            owner="root",
+            perm=0o644,
         )
 
         # ----------------------------------------------------
-        # backup
+        # Old backup
         # ----------------------------------------------------
 
-        backup = Node("backup")
+        self._mkfile(
+            "/var/www/html/backup/config.bak",
+            """# Old application configuration
+# Archived during migration
 
-        backup.add(
-            Node(
-                "config.bak",
-                "file",
-                """# Old configuration backup
-
-APP_NAME=ResearchPortal
+APP_NAME=research-portal
 APP_ENV=production
 
 DB_HOST=localhost
 DB_USER=research
-DB_PASS=summer_lab_2024
+DB_PASSWORD=summer_lab_2024
 
-BACKUP_USER=backup
-BACKUP_PATH=/var/backups
-
-# TODO:
-# Remove this file after migration.
-"""
-            )
+BACKUP_ENABLED=true
+BACKUP_SCRIPT=/opt/maintenance/backup.py
+""",
+            owner="root",
+            perm=0o644,
         )
 
-        backup.add(
-            Node(
-                "README.old",
-                "file",
-                """Old web application backup.
+        self._mkfile(
+            "/var/www/html/backup/README.old",
+            """Old backup directory.
 
-This directory should have been deleted
-after the migration.
+This directory is no longer used by the current application.
 
-Apparently it wasn't.
-"""
-            )
+Maintenance scripts are stored under /opt/maintenance.
+""",
+            owner="root",
+            perm=0o644,
         )
 
-        html.add(backup)
-
-        www.add(html)
-        var.add(www)
-
-        # ====================================================
-        # /opt
-        # ====================================================
-
-        opt = Node("opt")
-        maintenance = Node("maintenance")
-
         # ----------------------------------------------------
-        # backup.py
+        # Maintenance script
         # ----------------------------------------------------
 
-        maintenance.add(
-            Node(
-                "backup.py",
-                "file",
-                '''#!/usr/bin/env python3
+        self._mkfile(
+            "/opt/maintenance/backup.py",
+            """#!/usr/bin/env python3
 
 import os
 
@@ -324,484 +293,833 @@ os.system(
 )
 
 print("[+] Backup complete.")
-''',
-                perm="755"
-            )
+""",
+            owner="root",
+            perm=0o755,
+        )
+
+        self._mkfile(
+            "/opt/maintenance/README.txt",
+            """Maintenance utilities.
+
+The backup process is automated and should normally be run
+through the approved sudo configuration.
+""",
+            owner="root",
+            perm=0o644,
         )
 
         # ----------------------------------------------------
-        # maintenance README
+        # System files
         # ----------------------------------------------------
 
-        maintenance.add(
-            Node(
-                "README.txt",
-                "file",
-                """Maintenance scripts
-
-backup.py
-    Creates a compressed backup of the website.
-
-The script is executed automatically by the
-maintenance user.
-
-DO NOT MODIFY THE SCRIPT.
-
--- administrator
-"""
-            )
+        self._mkfile(
+            "/etc/hostname",
+            "lab-server\n",
+            owner="root",
+            perm=0o644,
         )
 
-        opt.add(maintenance)
+        self._mkfile(
+            "/etc/motd",
+            """Authorized personnel only.
 
-        # ====================================================
-        # /etc
-        # ====================================================
-
-        etc = Node("etc")
-
-        etc.add(
-            Node(
-                "hostname",
-                "file",
-                "lab-server\n"
-            )
+This system is part of the internal research environment.
+""",
+            owner="root",
+            perm=0o644,
         )
 
-        etc.add(
-            Node(
-                "motd",
-                "file",
-                """Research Server
-
-Authorized personnel only.
-
-This system is part of an internal
-security research environment.
-"""
-            )
-        )
-
-        etc.add(
-            Node(
-                "passwd",
-                "file",
-                """root:x:0:0:root:/root:/bin/bash
+        self._mkfile(
+            "/etc/passwd",
+            """root:x:0:0:root:/root:/bin/bash
 user:x:1000:1000:user:/home/user:/bin/bash
 research:x:1001:1001:research:/home/research:/bin/bash
-backup:x:1002:1002:backup:/home/backup:/bin/bash
-"""
-            )
+backup:x:1002:1002:backup:/var/backups:/usr/sbin/nologin
+""",
+            owner="root",
+            perm=0o644,
         )
 
-        etc.add(
-            Node(
-                "sudoers",
-                "file",
-                """# simplified sudo configuration
+        self._mkfile(
+            "/etc/sudoers",
+            """# Simulated sudo configuration
+
+Defaults env_reset, mail_badpass
 
 user ALL=(root) NOPASSWD: /opt/maintenance/backup.py
-"""
-            )
-        )
-
-        # ====================================================
-        # /var/log
-        # ====================================================
-
-        log = Node("log")
-
-        log.add(
-            Node(
-                "auth.log",
-                "file",
-                """Sep 12 02:10:31 lab-server sudo: user : command=/opt/maintenance/backup.py
-Sep 12 02:10:31 lab-server sudo: user : session opened
-Sep 12 02:10:31 lab-server sudo: user : session closed
-
-Sep 13 02:10:32 lab-server sudo: user : command=/opt/maintenance/backup.py
-Sep 13 02:10:32 lab-server sudo: user : session opened
-Sep 13 02:10:32 lab-server sudo: user : session closed
-
-Sep 14 02:10:31 lab-server maintenance:
-backup completed successfully
-"""
-            )
-        )
-
-        log.add(
-            Node(
-                "maintenance.log",
-                "file",
-                """Maintenance service
-
-02:10 - backup started
-02:10 - backup completed
-
-The backup script requires tar.
-
-No further action required.
-"""
-            )
-        )
-
-        var.add(log)
-
-        # ====================================================
-        # /var/backups
-        # ====================================================
-
-        backups = Node("backups")
-
-        backups.add(
-            Node(
-                "README.txt",
-                "file",
-                """Backups are generated automatically.
-
-Files older than 30 days are normally removed.
-"""
-            )
-        )
-
-        var.add(backups)
-
-        # ====================================================
-        # /tmp
-        # ====================================================
-
-        tmp = Node("tmp")
-
-        tmp.add(
-            Node(
-                "debug.log",
-                "file",
-                """debug mode disabled
-
-temporary maintenance information removed
-"""
-            )
-        )
-
-        root.add(tmp)
-
-        # ====================================================
-        # /root
-        # ====================================================
-
-        root_home = Node(
-            "root",
+""",
             owner="root",
-            perm="700"
+            perm=0o440,
         )
 
-        root_home.add(
-            Node(
-                "root.txt",
-                "file",
-                "FORGOTTEN{root_maintenance_complete_91af}\n",
-                owner="root",
-                perm="600"
-            )
+        # ----------------------------------------------------
+        # Logs
+        # ----------------------------------------------------
+
+        self._mkfile(
+            "/var/log/auth.log",
+            """Sep 10 08:12:01 lab-server sshd[412]: Accepted password for user
+Sep 10 08:13:14 lab-server sudo: user : TTY=pts/0 ; COMMAND=/usr/bin/id
+Sep 10 08:15:33 lab-server sudo: user : TTY=pts/0 ; COMMAND=/opt/maintenance/backup.py
+""",
+            owner="root",
+            perm=0o640,
         )
 
-        root_home.add(
-            Node(
-                "README.txt",
-                "file",
-                """Congratulations.
-
-You found the forgotten server.
-
-The administrator assumed that a small
-maintenance script could never become
-a security problem.
-
-They were wrong.
-
-This machine was designed as a fictional
-CTF environment.
-
-Nothing here connects to a real system.
-"""
-            )
+        self._mkfile(
+            "/var/log/maintenance.log",
+            """[INFO] Backup service initialized
+[INFO] Legacy maintenance configuration loaded
+[INFO] Backup script: /opt/maintenance/backup.py
+""",
+            owner="root",
+            perm=0o640,
         )
 
-        root.add(root_home)
+        # ----------------------------------------------------
+        # Backup directory
+        # ----------------------------------------------------
 
-        # ====================================================
-        # ADD TOP LEVEL DIRECTORIES
-        # ====================================================
+        self._mkfile(
+            "/var/backups/README.txt",
+            """Automated backups are stored here.
 
-        root.add(home)
-        root.add(var)
-        root.add(etc)
-        root.add(opt)
+Do not modify files in this directory manually.
+""",
+            owner="root",
+            perm=0o644,
+        )
 
-        return root
+        # ----------------------------------------------------
+        # Existing system binaries
+        # ----------------------------------------------------
+
+        self._mkfile(
+            "/usr/bin/tar",
+            "",
+            owner="root",
+            perm=0o755,
+        )
+
+        self._mkfile(
+            "/usr/bin/python3",
+            "",
+            owner="root",
+            perm=0o755,
+        )
+
+        self._mkfile(
+            "/bin/sh",
+            "",
+            owner="root",
+            perm=0o755,
+        )
+
+        # ----------------------------------------------------
+        # Root files
+        # ----------------------------------------------------
+
+        self._mkfile(
+            "/root/root.txt",
+            "FORGOTTEN{root_maintenance_complete_91af}\n",
+            owner="root",
+            perm=0o600,
+        )
+
+        self._mkfile(
+            "/root/README.txt",
+            """Congratulations.
+
+You successfully obtained root access through the vulnerable
+maintenance backup process.
+
+The intended vulnerability was PATH Hijacking.
+""",
+            owner="root",
+            perm=0o600,
+        )
+
+        # ----------------------------------------------------
+        # Temporary debug file
+        # ----------------------------------------------------
+
+        self._mkfile(
+            "/tmp/debug.log",
+            """[DEBUG] Temporary directory initialized.
+""",
+            owner="root",
+            perm=0o644,
+        )
 
     # --------------------------------------------------------
-    # PWD
+    # Path handling
     # --------------------------------------------------------
 
-    def pwd(self):
+    @staticmethod
+    def _split(path: str) -> List[str]:
+        return [
+            part
+            for part in path.strip("/").split("/")
+            if part
+        ]
 
-        node = self.current
-        parts = []
-
-        while node and node.name != "/":
-
-            parts.append(node.name)
-            node = node.parent
-
-        return "/" + "/".join(reversed(parts))
-
-    # --------------------------------------------------------
-    # RESOLVE
-    # --------------------------------------------------------
-
-    def resolve(self, path):
-
+    def normalize(self, path: str) -> str:
         if not path:
-            return self.current
+            return self.cwd
 
         if path.startswith("/"):
-
-            node = self.root
-            parts = path.strip("/").split("/")
-
+            parts: List[str] = []
         else:
+            parts = self._split(self.cwd)
 
-            node = self.current
-            parts = path.split("/")
-
-        for part in parts:
-
-            if part in ("", "."):
+        for part in path.split("/"):
+            if not part or part == ".":
                 continue
 
             if part == "..":
+                if parts:
+                    parts.pop()
+            else:
+                parts.append(part)
 
-                if node.parent:
-                    node = node.parent
+        return "/" + "/".join(parts)
 
-                continue
+    def resolve(self, path: str) -> Optional[Node]:
+        normalized = self.normalize(path)
 
-            if part not in node.children:
+        if normalized == "/":
+            return self.root
+
+        current = self.root
+
+        for part in self._split(normalized):
+            if current.node_type != "dir":
                 return None
 
-            node = node.children[part]
+            if part not in current.children:
+                return None
 
-        return node
+            current = current.children[part]
 
-    # --------------------------------------------------------
-    # LIST
-    # --------------------------------------------------------
+        return current
 
-    def list_dir(self, node):
+    def parent_and_name(
+        self,
+        path: str,
+    ) -> tuple[Optional[Node], str]:
+        normalized = self.normalize(path)
+        parts = self._split(normalized)
 
-        return sorted(node.children.keys())
+        if not parts:
+            return None, ""
+
+        name = parts[-1]
+        parent_path = "/" + "/".join(parts[:-1])
+
+        if parent_path == "":
+            parent_path = "/"
+
+        return self.resolve(parent_path), name
 
 
 fs = VirtualFS()
 
 
 # ============================================================
-# UTILITY
+# Utility
 # ============================================================
 
-def clear_screen():
+def print_prompt() -> str:
+    if fs.user == "root":
+        return f"root@lab-server:{fs.cwd}# "
 
-    print("\033[2J\033[H", end="")
-
-
-def show_intro():
-
-    clear_screen()
-    print(INTRO)
+    return f"user@lab-server:{fs.cwd}$ "
 
 
-def is_root():
+def format_permissions(node: Node) -> str:
+    if node.node_type == "dir":
+        prefix = "d"
+    else:
+        prefix = "-"
 
-    return fs.user == "root"
+    bits = [
+        0o400,
+        0o200,
+        0o100,
+        0o040,
+        0o020,
+        0o010,
+        0o004,
+        0o002,
+        0o001,
+    ]
+
+    chars = ["r", "w", "x", "r", "w", "x", "r", "w", "x"]
+
+    result = prefix
+
+    for bit, char in zip(bits, chars):
+        result += char if node.perm & bit else "-"
+
+    return result
 
 
-def permission_denied(node):
-
-    if node.owner == "root" and not is_root():
-        return True
-
-    return False
+def is_root() -> bool:
+    return fs.user == "root" or STATE["root"]
 
 
 # ============================================================
-# COMMANDS
+# Command: pwd
 # ============================================================
 
-def cmd_pwd(args):
+def cmd_pwd(args: List[str]) -> None:
+    print(fs.cwd)
 
-    print(fs.pwd())
 
+# ============================================================
+# Command: ls
+# ============================================================
 
-def cmd_ls(args):
+def cmd_ls(args: List[str]) -> None:
+    show_all = False
+    long_format = False
+    path = fs.cwd
 
-    node = fs.current
+    for arg in args:
+        if arg == "--":
+            continue
 
-    if args:
+        if arg.startswith("-") and arg != "-":
+            if "a" in arg:
+                show_all = True
 
-        node = fs.resolve(args[0])
+            if "l" in arg:
+                long_format = True
 
-        if not node or node.type != "dir":
+            continue
 
-            print("ls: cannot access: No such file or directory")
-            return
+        path = arg
 
-    if permission_denied(node):
+    node = fs.resolve(path)
 
-        print("Permission denied")
+    if node is None:
+        print(f"ls: cannot access '{path}': No such file or directory")
         return
 
-    for name in fs.list_dir(node):
-
-        child = node.children[name]
-
-        if child.type == "dir":
-
-            print(f"{name}/")
-
+    if node.node_type != "dir":
+        if long_format:
+            print(
+                f"{format_permissions(node)} "
+                f"{node.owner:<8} "
+                f"{node.name}"
+            )
         else:
+            print(node.name)
 
-            print(name)
+        return
+
+    entries = list(node.children.values())
+
+    if not show_all:
+        entries = [
+            entry
+            for entry in entries
+            if not entry.name.startswith(".")
+        ]
+
+    if not entries:
+        return
+
+    if long_format:
+        for entry in entries:
+            print(
+                f"{format_permissions(entry)} "
+                f"{entry.owner:<8} "
+                f"{entry.name}"
+            )
+    else:
+        print("  ".join(entry.name for entry in entries))
 
 
-def cmd_cd(args):
+# ============================================================
+# Command: cd
+# ============================================================
 
+def cmd_cd(args: List[str]) -> None:
     if not args:
-
-        fs.current = fs.root
+        fs.cwd = "/home/user"
         return
 
-    node = fs.resolve(args[0])
+    path = fs.normalize(args[0])
+    node = fs.resolve(path)
 
-    if not node or node.type != "dir":
-
-        print("cd: No such directory")
+    if node is None:
+        print(f"bash: cd: {args[0]}: No such file or directory")
         return
 
-    if permission_denied(node):
-
-        print("Permission denied")
+    if node.node_type != "dir":
+        print(f"bash: cd: {args[0]}: Not a directory")
         return
 
-    fs.current = node
+    # Root directory is inaccessible until root is obtained.
+    if path.startswith("/root") and not is_root():
+        print(f"bash: cd: {args[0]}: Permission denied")
+        return
+
+    fs.cwd = path
 
 
-def cmd_cat(args):
+# ============================================================
+# Command: cat
+# ============================================================
 
+def cmd_cat(args: List[str]) -> None:
     if not args:
-
-        print("usage: cat <file>")
+        print("cat: missing operand")
         return
 
-    node = fs.resolve(args[0])
+    for path in args:
+        node = fs.resolve(path)
 
-    if not node or node.type != "file":
+        if node is None:
+            print(f"cat: {path}: No such file or directory")
+            continue
 
-        print("cat: No such file")
+        if node.node_type == "dir":
+            print(f"cat: {path}: Is a directory")
+            continue
+
+        if path.startswith("/root") and not is_root():
+            print(f"cat: {path}: Permission denied")
+            continue
+
+        print(node.content)
+
+        if fs.normalize(path) == "/home/user/user.txt":
+            STATE["found_backup"] = True
+
+
+# ============================================================
+# Recursive filesystem traversal
+# ============================================================
+
+def walk(
+    node: Node,
+    current_path: str,
+):
+    yield current_path, node
+
+    if node.node_type != "dir":
         return
 
-    if permission_denied(node):
+    for name, child in node.children.items():
+        if current_path == "/":
+            child_path = f"/{name}"
+        else:
+            child_path = f"{current_path}/{name}"
 
-        print("Permission denied")
+        yield from walk(child, child_path)
+
+
+# ============================================================
+# Command: find
+# ============================================================
+
+def cmd_find(args: List[str]) -> None:
+    if not args:
+        print("find: missing path")
         return
 
-    print(node.content)
+    search_path = args[0]
+    name_filter: Optional[str] = None
 
-    path = fs.pwd()
+    index = 1
 
-    if node.name == "config.bak":
+    while index < len(args):
+        arg = args[index]
 
-        STATE["found_backup"] = True
-        STATE["found_credentials"] = True
+        if arg == "-name" and index + 1 < len(args):
+            name_filter = args[index + 1]
+            index += 2
+            continue
 
-    if node.name == ".bash_history":
+        index += 1
 
-        STATE["found_history"] = True
+    root = fs.resolve(search_path)
 
-    if node.name == "backup.py":
+    if root is None:
+        print(
+            f"find: '{search_path}': "
+            "No such file or directory"
+        )
+        return
 
-        STATE["found_script"] = True
+    normalized_root = fs.normalize(search_path)
 
-    if node.name == "user.txt":
+    for path, node in walk(root, normalized_root):
+        if path == normalized_root:
+            continue
 
-        STATE["user_flag"] = True
+        if name_filter is not None:
+            if node.name != name_filter:
+                continue
 
-    if node.name == "root.txt":
+        if path.startswith("/root") and not is_root():
+            continue
 
-        STATE["root_flag"] = True
+        print(path)
 
 
-def cmd_id(args):
+# ============================================================
+# Command: grep
+# ============================================================
 
-    if is_root():
+def cmd_grep(args: List[str]) -> None:
+    if len(args) < 2:
+        print("Usage: grep <pattern> <file>")
+        return
 
+    pattern = args[0]
+
+    for path in args[1:]:
+        node = fs.resolve(path)
+
+        if node is None:
+            print(f"grep: {path}: No such file or directory")
+            continue
+
+        if node.node_type == "dir":
+            print(f"grep: {path}: Is a directory")
+            continue
+
+        if path.startswith("/root") and not is_root():
+            print(f"grep: {path}: Permission denied")
+            continue
+
+        lines = node.content.splitlines()
+
+        for line in lines:
+            if pattern in line:
+                print(line)
+
+
+# ============================================================
+# Command: whoami
+# ============================================================
+
+def cmd_whoami(args: List[str]) -> None:
+    print(fs.user)
+
+
+# ============================================================
+# Command: id
+# ============================================================
+
+def cmd_id(args: List[str]) -> None:
+    if fs.user == "root":
         print(
             "uid=0(root) gid=0(root) "
             "groups=0(root)"
         )
-
     else:
-
         print(
             "uid=1000(user) gid=1000(user) "
             "groups=1000(user)"
         )
 
 
-def cmd_whoami(args):
+# ============================================================
+# Command: hostname
+# ============================================================
 
-    print(fs.user)
-
-
-def cmd_hostname(args):
-
+def cmd_hostname(args: List[str]) -> None:
     print("lab-server")
 
 
-def cmd_env(args):
+# ============================================================
+# Command: env
+# ============================================================
 
-    print("PATH=/usr/local/bin:/usr/bin:/bin")
-    print("USER=user")
-    print("HOME=/home/user")
-    print("HOSTNAME=lab-server")
+def cmd_env(args: List[str]) -> None:
+    print(f"PATH={STATE['path']}")
+    print("USER=" + fs.user)
+    print("HOME=" + ("/root" if is_root() else "/home/user"))
+    print("SHELL=/bin/bash")
 
 
-def cmd_sudo(args):
+# ============================================================
+# Command: echo
+# ============================================================
 
-    STATE["checked_sudo"] = True
+def cmd_echo(args: List[str]) -> None:
+    text = " ".join(args)
 
+    text = text.replace(
+        "$PATH",
+        STATE["path"],
+    )
+
+    text = text.replace(
+        "${PATH}",
+        STATE["path"],
+    )
+
+    text = text.replace(
+        "$USER",
+        fs.user,
+    )
+
+    print(text)
+
+
+# ============================================================
+# Command: which
+# ============================================================
+
+def cmd_which(args: List[str]) -> None:
     if not args:
+        print("which: missing argument")
+        return
+
+    command = args[0]
+
+    if command == "tar":
+        path_entries = STATE["path"].split(":")
+
+        for directory in path_entries:
+            candidate = (
+                directory.rstrip("/")
+                + "/"
+                + command
+            )
+
+            node = fs.resolve(candidate)
+
+            if node is not None and node.node_type == "file":
+                if node.perm & 0o111:
+                    print(candidate)
+                    return
+
+        print(f"which: no {command} in ({STATE['path']})")
+        return
+
+    if command in ("python", "python3"):
+        for directory in STATE["path"].split(":"):
+            candidate = (
+                directory.rstrip("/")
+                + "/"
+                + command
+            )
+
+            node = fs.resolve(candidate)
+
+            if node is not None:
+                print(candidate)
+                return
+
+        if command == "python":
+            print("/usr/bin/python3")
+            return
+
+    print(f"which: no {command} in ({STATE['path']})")
+
+
+# ============================================================
+# Command: export
+# ============================================================
+
+def cmd_export(args: List[str]) -> None:
+    if not args:
+        print(f"PATH={STATE['path']}")
+        return
+
+    for assignment in args:
+        if "=" not in assignment:
+            print(
+                f"export: '{assignment}': "
+                "not a valid identifier"
+            )
+            continue
+
+        key, value = assignment.split("=", 1)
+
+        if key == "PATH":
+            STATE["path"] = value
+            print(f"PATH={STATE['path']}")
+        else:
+            print(f"{key}={value}")
+
+
+# ============================================================
+# Command: touch
+# ============================================================
+
+def cmd_touch(args: List[str]) -> None:
+    if not args:
+        print("touch: missing file operand")
+        return
+
+    for path in args:
+        normalized = fs.normalize(path)
+
+        # For this CTF, fake tar creation is intentionally
+        # limited to /tmp.
+        if not normalized.startswith("/tmp/"):
+            print(
+                f"touch: cannot touch '{path}': "
+                "Permission denied"
+            )
+            continue
+
+        existing = fs.resolve(normalized)
+
+        if existing is not None:
+            print(f"touch: '{path}' already exists")
+            continue
+
+        parent, name = fs.parent_and_name(normalized)
+
+        if parent is None or parent.node_type != "dir":
+            print(
+                f"touch: cannot touch '{path}': "
+                "No such file or directory"
+            )
+            continue
+
+        if fs.user != "user" and fs.user != "root":
+            print(
+                f"touch: cannot touch '{path}': "
+                "Permission denied"
+            )
+            continue
+
+        new_file = Node(
+            name=name,
+            node_type="file",
+            content="",
+            owner=fs.user,
+            perm=0o644,
+        )
+
+        parent.children[name] = new_file
+
+        if normalized == "/tmp/tar":
+            STATE["created_fake_tar"] = True
+            print("[+] Created /tmp/tar")
+            print("[*] The file is not executable yet.")
+        else:
+            print(f"[+] Created {normalized}")
+
+
+# ============================================================
+# Command: chmod
+# ============================================================
+
+def cmd_chmod(args: List[str]) -> None:
+    if len(args) < 2:
+        print("chmod: missing operand")
+        return
+
+    mode = args[0]
+    paths = args[1:]
+
+    # Support common forms such as:
+    # chmod +x file
+    # chmod 755 file
+
+    for path in paths:
+        node = fs.resolve(path)
+
+        if node is None:
+            print(
+                f"chmod: cannot access '{path}': "
+                "No such file or directory"
+            )
+            continue
+
+        if node.owner != fs.user and not is_root():
+            print(
+                f"chmod: changing permissions of '{path}': "
+                "Operation not permitted"
+            )
+            continue
+
+        if mode == "+x":
+            node.perm |= 0o111
+
+        elif mode == "-x":
+            node.perm &= ~0o111
+
+        elif mode.isdigit():
+            try:
+                node.perm = int(mode, 8)
+            except ValueError:
+                print(f"chmod: invalid mode: '{mode}'")
+                continue
+
+        else:
+            print(f"chmod: invalid mode: '{mode}'")
+            continue
 
         print(
-            "usage: sudo -l"
+            f"Mode of '{path}' changed to "
+            f"{node.perm:03o}"
+        )
+
+
+# ============================================================
+# Command: python
+# ============================================================
+
+def cmd_python(args: List[str]) -> None:
+    print(
+        "Python interpreter is simulated in this CTF."
+    )
+
+    if args:
+        print(
+            "[*] Python commands are not executed "
+            "on the host system."
+        )
+
+    print(
+        "[*] No privilege escalation is possible "
+        "through Python."
+    )
+
+
+# ============================================================
+# Command: sudo
+# ============================================================
+
+def cmd_sudo(args: List[str]) -> None:
+    if not args:
+        print(
+            "usage: sudo -l | "
+            "sudo /opt/maintenance/backup.py"
         )
         return
 
+    # --------------------------------------------------------
+    # sudo -l
+    # --------------------------------------------------------
+
     if args[0] == "-l":
+        STATE["checked_sudo"] = True
 
         print(
-            "Matching Defaults entries for user on lab-server:"
+            "Matching Defaults entries for user on "
+            "lab-server:"
         )
-
+        print(
+            "    env_reset, mail_badpass"
+        )
         print()
-
         print(
             "User user may run the following commands "
             "on lab-server:"
         )
-
-        print()
-
         print(
             "    (root) NOPASSWD: "
             "/opt/maintenance/backup.py"
@@ -810,687 +1128,459 @@ def cmd_sudo(args):
         return
 
     # --------------------------------------------------------
-    # Execute backup script
+    # sudo backup.py
     # --------------------------------------------------------
 
-    if args[0] == "/opt/maintenance/backup.py":
+    command = args[0]
 
-        cmd_backup(args[1:], sudo=True)
-        return
-
-    print(
-        "sudo: command not permitted"
-    )
-
-
-def cmd_find(args):
-
-    if not args:
-
-        start = fs.current
-        base = fs.pwd()
-
-    else:
-
-        start = fs.resolve(args[0])
-        base = args[0]
-
-    if not start:
-
-        print("find: path not found")
-        return
-
-    if permission_denied(start):
-
-        print("Permission denied")
-        return
-
-    def walk(node, path):
-
-        print(path)
-
-        if node.type != "dir":
-            return
-
-        for child in sorted(
-            node.children.values(),
-            key=lambda x: x.name
-        ):
-
-            if child.owner == "root" and not is_root():
-
-                continue
-
-            child_path = (
-                path.rstrip("/") +
-                "/" +
-                child.name
-            )
-
-            walk(child, child_path)
-
-    walk(start, base)
-
-
-def cmd_grep(args):
-
-    if len(args) < 2:
-
+    if command != "/opt/maintenance/backup.py":
         print(
-            "usage: grep <pattern> <file>"
-        )
-
-        return
-
-    pattern = args[0]
-    node = fs.resolve(args[1])
-
-    if not node or node.type != "file":
-
-        print(
-            "grep: No such file"
-        )
-
-        return
-
-    if permission_denied(node):
-
-        print("Permission denied")
-        return
-
-    for line in node.content.splitlines():
-
-        if pattern.lower() in line.lower():
-
-            print(line)
-
-
-def cmd_clear(args):
-
-    show_intro()
-
-
-# ============================================================
-# PYTHON
-# ============================================================
-
-def cmd_python(args):
-
-    if not args:
-
-        print("Python 3.12.0")
-        print(
-            "Interactive interpreter is simulated."
+            f"sudo: {command}: "
+            "command not allowed"
         )
         return
 
-    if "-c" not in args:
-
-        print(
-            "Python interpreter closed."
-        )
-
+    if fs.user == "root":
+        print("[*] Already running as root.")
         return
-
-    command = " ".join(args)
-
-    # --------------------------------------------------------
-    # Simulated shell escape
-    # --------------------------------------------------------
-
-    shell_patterns = [
-
-        "import os",
-        "os.system",
-        "os.execl",
-        "subprocess",
-    ]
-
-    if any(
-        pattern in command
-        for pattern in shell_patterns
-    ):
-
-        if STATE["checked_sudo"]:
-
-            fs.user = "root"
-            STATE["root"] = True
-
-            print()
-            print(
-                "[+] Python executed with elevated privileges."
-            )
-
-            print(
-                "[+] Privilege escalation successful."
-            )
-
-            print(
-                "[+] uid=0(root)"
-            )
-
-            print()
-
-        else:
-
-            print(
-                "Python executed, but the process "
-                "does not have elevated privileges."
-            )
-
-        return
-
-    print(
-        "Python interpreter closed."
-    )
-
-
-# ============================================================
-# BACKUP / PATH HIJACK SIMULATION
-# ============================================================
-
-def cmd_touch(args):
-
-    if not args:
-
-        print("usage: touch <file>")
-        return
-
-    filename = args[0]
-
-    if filename == "tar":
-
-        STATE["created_fake_tar"] = True
-
-        print(
-            f"created: {filename}"
-        )
-
-        return
-
-    print(
-        f"touch: created {filename}"
-    )
-
-
-def cmd_chmod(args):
-
-    if len(args) < 2:
-
-        print(
-            "usage: chmod <mode> <file>"
-        )
-
-        return
-
-    print(
-        f"mode changed: {args[1]}"
-    )
-
-
-def cmd_export(args):
-
-    if len(args) != 1 or "=" not in args[0]:
-
-        print(
-            "usage: export NAME=value"
-        )
-
-        return
-
-    name, value = args[0].split("=", 1)
-
-    if name == "PATH":
-
-        if STATE["created_fake_tar"]:
-
-            STATE["executed_exploit"] = True
-
-            print(
-                "[+] PATH modified."
-            )
-
-            print(
-                "[+] A privileged script uses an "
-                "unqualified executable."
-            )
-
-            print(
-                "[+] This may be exploitable."
-            )
-
-        else:
-
-            print(
-                "PATH updated."
-            )
-
-    else:
-
-        print(
-            f"{name} exported."
-        )
-
-
-# ============================================================
-# HINT SYSTEM
-# ============================================================
-
-def cmd_hint(args):
-
-    # --------------------------------------------------------
-    # Initial enumeration
-    # --------------------------------------------------------
-
-    if not STATE["found_backup"]:
-
-        print(
-            "HINT: READMEやnotes.txtを読んで、"
-            "Web関連のディレクトリを探してみよう。"
-        )
-
-        return
-
-    # --------------------------------------------------------
-
-    if not STATE["found_credentials"]:
-
-        print(
-            "HINT: /var/www/html/backup/ に"
-            "古いファイルが残っている。"
-        )
-
-        return
-
-    # --------------------------------------------------------
-
-    if not STATE["found_history"]:
-
-        print(
-            "HINT: userの操作履歴を確認してみよう。"
-        )
-
-        return
-
-    # --------------------------------------------------------
-
-    if not STATE["found_script"]:
-
-        print(
-            "HINT: /opt/maintenance/ に"
-            "何かスクリプトがある。"
-        )
-
-        return
-
-    # --------------------------------------------------------
 
     if not STATE["checked_sudo"]:
-
         print(
-            "HINT: 現在のユーザーがrootとして"
-            "実行できるコマンドを確認しよう。"
+            "sudo: permission denied"
         )
+        print(
+            "[*] Investigate sudo privileges first."
+        )
+        return
 
+    cmd_backup([])
+
+
+# ============================================================
+# Vulnerable backup script
+# ============================================================
+
+def cmd_backup(args: Optional[List[str]] = None) -> None:
+    args = args or []
+
+    if fs.user != "user":
+        print(
+            "[!] Backup script can only be executed "
+            "by user."
+        )
         return
 
     # --------------------------------------------------------
+    # Locate tar according to PATH
+    # --------------------------------------------------------
 
-    if not STATE["root"]:
+    path_entries = STATE["path"].split(":")
 
-        print(
-            "HINT: sudoで実行できるのはPythonスクリプト。"
-            "スクリプトの内容をよく読もう。"
+    tar_node: Optional[Node] = None
+    tar_path: Optional[str] = None
+
+    for directory in path_entries:
+        candidate = (
+            directory.rstrip("/")
+            + "/tar"
         )
 
+        node = fs.resolve(candidate)
+
+        if node is not None and node.node_type == "file":
+            tar_node = node
+            tar_path = candidate
+            break
+
+    if tar_node is None:
+        print(
+            "[!] tar could not be resolved from PATH."
+        )
         return
 
     # --------------------------------------------------------
-
-    if not STATE["user_flag"]:
-
-        print(
-            "HINT: user.txtは自分のホームディレクトリにある。"
-        )
-
-        return
-
+    # Intended vulnerability:
+    #
+    # /tmp/tar exists
+    # /tmp/tar is executable
+    # /tmp comes before /usr/bin
     # --------------------------------------------------------
 
-    if not STATE["root_flag"]:
-
+    if tar_path != "/tmp/tar":
         print(
-            "HINT: root権限を取得したなら、"
-            "/rootを調べよう。"
+            "[*] Starting backup..."
         )
-
+        print(
+            "[*] tar resolved to "
+            f"{tar_path}"
+        )
+        print(
+            "[!] No PATH hijacking detected."
+        )
+        print(
+            "[+] Backup complete."
+        )
         return
+
+    if not STATE["created_fake_tar"]:
+        print(
+            "[!] /tmp/tar was not created."
+        )
+        return
+
+    if not (tar_node.perm & 0o111):
+        print(
+            "[!] /tmp/tar is not executable."
+        )
+        print(
+            "[*] Try: chmod +x /tmp/tar"
+        )
+        return
+
+    if "/tmp" not in path_entries:
+        print(
+            "[!] /tmp is not present in PATH."
+        )
+        return
+
+    if "/usr/bin" in path_entries:
+        tmp_index = path_entries.index("/tmp")
+        usr_index = path_entries.index("/usr/bin")
+
+        if tmp_index > usr_index:
+            print(
+                "[!] /tmp appears after /usr/bin."
+            )
+            return
+
+    # --------------------------------------------------------
+    # Exploit successful
+    # --------------------------------------------------------
+
+    print("[*] Starting backup...")
+    print("[*] Executing tar from PATH...")
+    print("[+] /tmp/tar was executed.")
+    print("[+] Privilege escalation successful!")
+
+    STATE["executed_exploit"] = True
+    STATE["root"] = True
+
+    fs.user = "root"
+
+
+# ============================================================
+# Command: status
+# ============================================================
+
+def cmd_status(args: List[str]) -> None:
+    print()
+    print("=== CTF STATUS ===")
+    print()
 
     print(
-        "HINT: もうすべてのフラグを取得している。"
+        f"User access : "
+        f"{'COMPLETE' if STATE['found_backup'] else 'NOT FOUND'}"
     )
 
+    print(
+        f"Sudo checked: "
+        f"{'YES' if STATE['checked_sudo'] else 'NO'}"
+    )
 
-# ============================================================
-# SCORE
-# ============================================================
+    print(
+        f"Fake tar    : "
+        f"{'CREATED' if STATE['created_fake_tar'] else 'NO'}"
+    )
 
-def show_status():
+    print(
+        f"Root access : "
+        f"{'COMPLETE' if STATE['root'] else 'NO'}"
+    )
 
-    elapsed = int(
-        time.time() - START_TIME
+    print(
+        f"PATH        : {STATE['path']}"
     )
 
     print()
-    print(
-        "========== STATUS =========="
-    )
-
-    print(
-        f"User flag : "
-        f"{'OWNED' if STATE['user_flag'] else '---'}"
-    )
-
-    print(
-        f"Root      : "
-        f"{'YES' if STATE['root'] else 'NO'}"
-    )
-
-    print(
-        f"Root flag : "
-        f"{'OWNED' if STATE['root_flag'] else '---'}"
-    )
-
-    print(
-        f"Time      : {elapsed}s"
-    )
-
-    print(
-        "============================"
-    )
 
 
 # ============================================================
-# HELP
+# Command: hint
 # ============================================================
 
-def cmd_help(args):
+def cmd_hint(args: List[str]) -> None:
+    print()
 
-    print(
-        """
-Available commands:
+    if not STATE["checked_sudo"]:
+        print(
+            "[HINT] Check your sudo privileges."
+        )
 
-  pwd
-  ls
-  cd
-  cat
-  find
-  grep
+    elif not STATE["created_fake_tar"]:
+        print(
+            "[HINT] The backup script calls tar."
+        )
+        print(
+            "[HINT] Investigate how tar is resolved."
+        )
+        print(
+            "[HINT] Can you place your own executable "
+            "named 'tar' somewhere earlier in PATH?"
+        )
 
-  id
-  whoami
-  hostname
-  env
+    elif not (fs.resolve("/tmp/tar").perm & 0o111):
+        print(
+            "[HINT] /tmp/tar exists but is not executable."
+        )
 
-  sudo
-  python3
-  python
+    elif "/tmp" not in STATE["path"].split(":"):
+        print(
+            "[HINT] /tmp needs to be included in PATH."
+        )
 
-  touch
-  chmod
-  export
+    elif STATE["path"].split(":").index("/tmp") > (
+        STATE["path"].split(":").index("/usr/bin")
+        if "/usr/bin" in STATE["path"].split(":")
+        else 999
+    ):
+        print(
+            "[HINT] PATH is searched from left to right."
+        )
+        print(
+            "[HINT] Put /tmp before /usr/bin."
+        )
 
-  hint
-  status
-  clear
-  help
-"""
-    )
+    elif not STATE["root"]:
+        print(
+            "[HINT] Run the maintenance backup "
+            "script through sudo."
+        )
+
+    else:
+        print(
+            "[+] No hints needed. You are root."
+        )
+
+    print()
 
 
 # ============================================================
-# COMMAND TABLE
+# Command: clear
+# ============================================================
+
+def cmd_clear(args: List[str]) -> None:
+    print("\033[2J\033[H", end="")
+
+
+# ============================================================
+# Command: help
+# ============================================================
+
+def cmd_help(args: List[str]) -> None:
+    print()
+    print("Available commands:")
+    print()
+    print("  pwd")
+    print("  ls [options] [path]")
+    print("  cd <path>")
+    print("  cat <file>")
+    print("  find <path> [-name <name>]")
+    print("  grep <pattern> <file>")
+    print("  id")
+    print("  whoami")
+    print("  hostname")
+    print("  env")
+    print("  echo <text>")
+    print("  which <command>")
+    print("  export PATH=<path>")
+    print("  touch <file>")
+    print("  chmod <mode> <file>")
+    print("  sudo -l")
+    print("  sudo /opt/maintenance/backup.py")
+    print("  python")
+    print("  python3")
+    print("  status")
+    print("  hint")
+    print("  clear")
+    print("  help")
+    print("  exit")
+    print()
+
+
+# ============================================================
+# Command: exit
+# ============================================================
+
+def cmd_exit(args: List[str]) -> bool:
+    return True
+
+
+# ============================================================
+# Command table
 # ============================================================
 
 COMMANDS = {
-
     "pwd": cmd_pwd,
     "ls": cmd_ls,
     "cd": cmd_cd,
     "cat": cmd_cat,
     "find": cmd_find,
     "grep": cmd_grep,
-
     "id": cmd_id,
     "whoami": cmd_whoami,
     "hostname": cmd_hostname,
     "env": cmd_env,
-
-    "sudo": cmd_sudo,
-
-    "python": cmd_python,
-    "python3": cmd_python,
-
+    "echo": cmd_echo,
+    "which": cmd_which,
+    "export": cmd_export,
     "touch": cmd_touch,
     "chmod": cmd_chmod,
-    "export": cmd_export,
-
+    "sudo": cmd_sudo,
+    "python": cmd_python,
+    "python3": cmd_python,
+    "status": cmd_status,
     "hint": cmd_hint,
-    "status": lambda args: show_status(),
     "clear": cmd_clear,
     "help": cmd_help,
 }
 
 
 # ============================================================
-# TAB COMPLETION
+# Command execution
 # ============================================================
 
-class GameCompleter(Completer):
+def execute_command(command_line: str) -> bool:
+    command_line = command_line.strip()
 
-    def get_completions(
-        self,
-        document,
-        complete_event
-    ):
-
-        text = document.text_before_cursor
-        parts = text.split()
-
-        # ----------------------------------------------------
-        # command completion
-        # ----------------------------------------------------
-
-        if len(parts) <= 1:
-
-            word = parts[0] if parts else ""
-
-            for command in sorted(COMMANDS):
-
-                if command.startswith(word):
-
-                    yield Completion(
-                        command,
-                        start_position=-len(word)
-                    )
-
-            return
-
-        # ----------------------------------------------------
-        # path completion
-        # ----------------------------------------------------
-
-        word = parts[-1]
-
-        if "/" in word:
-
-            if word.startswith("/"):
-
-                parent_path, prefix = word.rsplit(
-                    "/",
-                    1
-                )
-
-                node = fs.resolve(
-                    parent_path or "/"
-                )
-
-            else:
-
-                full = fs.pwd() + "/" + word
-
-                parent_path, prefix = full.rsplit(
-                    "/",
-                    1
-                )
-
-                node = fs.resolve(parent_path)
-
-        else:
-
-            node = fs.current
-            prefix = word
-
-        if not node or node.type != "dir":
-            return
-
-        for name in fs.list_dir(node):
-
-            child = node.children[name]
-
-            if permission_denied(child):
-                continue
-
-            if name.startswith(prefix):
-
-                yield Completion(
-                    name,
-                    start_position=-len(prefix)
-                )
-
-
-# ============================================================
-# START
-# ============================================================
-
-session = PromptSession(
-    completer=GameCompleter()
-)
-
-show_intro()
-
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
-
-while True:
-
-    if fs.user == "root":
-
-        prompt = "root@lab-server# "
-
-    else:
-
-        prompt = "user@lab-server$ "
+    if not command_line:
+        return False
 
     try:
+        args = shlex.split(command_line)
+    except ValueError as exc:
+        print(f"bash: syntax error: {exc}")
+        return False
 
-        command = session.prompt(
-            prompt
-        ).strip()
+    if not args:
+        return False
 
-    except KeyboardInterrupt:
-
-        print(
-            "\nUse 'exit' to leave the challenge."
-        )
-
-        continue
-
-    except EOFError:
-
-        print()
-        break
-
-    if not command:
-        continue
-
-    # --------------------------------------------------------
-    # Exit
-    # --------------------------------------------------------
+    command = args[0]
+    command_args = args[1:]
 
     if command == "exit":
+        return True
 
+    if command not in COMMANDS:
         print(
-            "\nChallenge terminated."
+            f"bash: {command}: "
+            "command not found"
         )
+        return False
 
-        break
-
-    # --------------------------------------------------------
-    # Parse
-    # --------------------------------------------------------
-
-    parts = command.split()
-
-    name = parts[0]
-    args = parts[1:]
-
-    # --------------------------------------------------------
-    # Execute
-    # --------------------------------------------------------
-
-    fn = COMMANDS.get(name)
-
-    if fn:
-
-        fn(args)
-
-    else:
-
+    try:
+        COMMANDS[command](command_args)
+    except Exception as exc:
         print(
-            f"{name}: command not found"
+            f"[internal error] "
+            f"{type(exc).__name__}: {exc}"
         )
 
     # --------------------------------------------------------
-    # Win condition
+    # Root flag detection
     # --------------------------------------------------------
 
-    if (
-        STATE["user_flag"]
-        and STATE["root_flag"]
-    ):
-
-        elapsed = int(
-            time.time() - START_TIME
-        )
+    if STATE["root"] and not STATE.get("_root_message_shown"):
+        STATE["_root_message_shown"] = True
 
         print()
         print(
-            "╔══════════════════════════════════════════╗"
+            "[+] You now have root privileges."
         )
         print(
-            "║              MACHINE PWNED              ║"
+            "[+] Try: whoami"
         )
         print(
-            "╚══════════════════════════════════════════╝"
+            "[+] Then investigate /root."
         )
-
-        print()
-        print(
-            f"TIME: {elapsed}s"
-        )
-
-        print()
-        print(
-            "You compromised the forgotten server."
-        )
-
-        print(
-            "Both flags have been captured."
-        )
-
         print()
 
-        break
+    return False
+
+
+# ============================================================
+# Banner
+# ============================================================
+
+def print_banner() -> None:
+    print()
+    print(
+        "╔══════════════════════════════════════════════════════════╗"
+    )
+    print(
+        "║                  THE FORGOTTEN SERVER                   ║"
+    )
+    print(
+        "║                    Linux CTF - Easy                     ║"
+    )
+    print(
+        "╚══════════════════════════════════════════════════════════╝"
+    )
+    print()
+    print(
+        "A forgotten internal research server has been found."
+    )
+    print(
+        "Investigate the system and obtain the flags."
+    )
+    print()
+    print("Targets:")
+    print("  - user.txt")
+    print("  - root.txt")
+    print()
+    print(
+        "Type 'help' for available commands."
+    )
+    print()
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> None:
+    print_banner()
+
+    session = PromptSession()
+
+    with patch_stdout():
+        while True:
+            try:
+                command_line = session.prompt(
+                    print_prompt()
+                )
+
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            should_exit = execute_command(command_line)
+
+            if should_exit:
+                print("Connection closed.")
+                break
+
+            # ------------------------------------------------
+            # Win condition
+            # ------------------------------------------------
+
+            if STATE["root"]:
+                root_flag = fs.resolve("/root/root.txt")
+
+                if root_flag is not None:
+                    # Don't automatically reveal the flag.
+                    # Player must read root.txt manually.
+                    pass
+
+
+if __name__ == "__main__":
+    main()
